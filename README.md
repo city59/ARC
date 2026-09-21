@@ -12,7 +12,7 @@ Training balances BPR ranking loss with relation and message information costs. 
 
 ## Setup
 
-Tested with Python 3.9 and PyTorch 1.12.1 (CUDA) / 2.3.0 (CPU). Run the following commands from this directory:
+Tested with Python 3.9 and PyTorch 1.12.1 (CUDA) / 2.3.0 (CPU). The requirements pin the 2.3.0 reference environment, including its runtime dependencies. Select a CPU or CUDA wheel using the commands in [requirements.txt](requirements.txt), then run from this directory:
 
 ```bash
 python -m pip install -r requirements.txt
@@ -32,22 +32,16 @@ The loader preserves the supplied train/test split and creates validation data f
 
 ## Training and Evaluation
 
-Train all three datasets sequentially:
+Train a dataset (`movie`, `music`, or `book`):
 
 ```bash
-python run_all.py --device auto --output-dir runs/arc
+python main.py --dataset music --device auto --output-dir runs/arc
 ```
 
-Train a single dataset:
+Run a short check:
 
 ```bash
-python main.py --dataset music --device auto --output-dir runs/music
-```
-
-Run a short check on all datasets:
-
-```bash
-python run_all.py --smoke-test --device auto --output-dir runs/smoke
+python main.py --dataset music --smoke-test --device auto --output-dir runs/smoke
 ```
 
 Evaluate a saved model:
@@ -58,4 +52,4 @@ python main.py --eval-only --checkpoint runs/arc/music/train/best.pt --device au
 
 `auto` selects CUDA when available. Use `--device cpu` to force CPU execution. Logs, checkpoints, and metrics are saved under `<output-dir>/<dataset>/train/` (`smoke/` for smoke tests). Choose a new output directory for each run.
 
-Evaluation uses full-catalog ranking with seen-item filtering. Smoke tests evaluate only a small user subset; full ARC benchmarking remains pending, as stated in the manuscript. See [verification notes](VERIFICATION.md) for completed checks and `python main.py --help` for options.
+Evaluation uses full-catalog ranking with seen-item filtering. Smoke tests evaluate only a small user subset; full ARC benchmarking remains pending, as stated in the manuscript. See `python main.py --help` for options.

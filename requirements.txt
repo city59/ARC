@@ -1,0 +1,44 @@
+# ARC - Adaptive Relation Compression
+# Reference environment: Python 3.9, NumPy 1.26.4, PyTorch 2.3.0.
+# The Python package versions below match the tested Windows CPU environment.
+# Install in a dedicated virtual environment:
+#   python -m venv .venv
+# Activate .venv, then choose ONE PyTorch wheel source before installing this file.
+#
+# CPU (Linux / Windows):
+#   python -m pip install torch==2.3.0 --index-url https://download.pytorch.org/whl/cpu
+# NVIDIA CUDA 11.8 (Linux / Windows):
+#   python -m pip install torch==2.3.0 --index-url https://download.pytorch.org/whl/cu118
+# NVIDIA CUDA 12.1 (Linux / Windows):
+#   python -m pip install torch==2.3.0 --index-url https://download.pytorch.org/whl/cu121
+# Then install the pinned Python dependencies:
+#   python -m pip install -r requirements.txt
+#
+# torch==2.3.0 accepts the matching +cpu / +cu118 / +cu121 wheel variants.
+# CUDA builds require a compatible NVIDIA driver. Their platform-specific
+# NVIDIA runtime packages are resolved by the selected PyTorch wheel.
+# Official wheel commands: https://pytorch.org/get-started/previous-versions/
+# PyTorch 2.3.0 CUDA wheel instructions are provided for setup; the separately tested
+# legacy GPU environment used PyTorch 1.12.1 with CUDA 11.3.
+
+# Direct ARC dependencies: graph computation, training, and array-based loading.
+numpy==1.26.4
+torch==2.3.0
+
+# PyTorch's Python runtime dependencies, pinned to the reference environment.
+filelock==3.14.0
+typing_extensions==4.12.2
+sympy==1.12.1
+mpmath==1.3.0
+networkx==3.2.1
+Jinja2==3.1.4
+MarkupSafe==2.1.5
+fsspec==2024.6.0
+
+# Windows numerical runtime used by the reference PyTorch installation.
+mkl==2021.4.0; platform_system == "Windows"
+intel-openmp==2021.4.0; platform_system == "Windows"
+tbb==2021.12.0; platform_system == "Windows"
+
+# Quick check (replace music with movie or book to check another dataset):
+#   python main.py --dataset music --smoke-test --device auto --output-dir runs/setup_check
