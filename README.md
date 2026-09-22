@@ -41,9 +41,3 @@ Run a short check:
 ```bash
 python main.py --dataset music --smoke-test --device auto --output-dir runs/smoke
 ```
-
-Evaluate a saved model:
-
-```bash
-python main.py --eval-only --checkpoint runs/arc/music/train/best.pt --device auto
-```
