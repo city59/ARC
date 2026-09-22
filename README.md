@@ -49,5 +49,3 @@ Evaluate a saved model:
 ```bash
 python main.py --eval-only --checkpoint runs/arc/music/train/best.pt --device auto
 ```
-
-`auto` selects CUDA when available. Use `--device cpu` to force CPU execution. Logs, checkpoints, and metrics are saved under `<output-dir>/<dataset>/train/` (`smoke/` for smoke tests). Choose a new output directory for each run.
