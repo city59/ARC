@@ -28,8 +28,6 @@ The included datasets are stored under `data/`:
 | `music` | Last.FM |
 | `book` | Book-Crossing |
 
-The loader preserves the supplied train/test split and creates validation data from training positives. Only positive training interactions enter the graph.
-
 ## Training and Evaluation
 
 Train a dataset (`movie`, `music`, or `book`):
