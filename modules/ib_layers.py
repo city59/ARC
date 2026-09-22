@@ -20,8 +20,9 @@ class GaussianMessageLayer(nn.Module):
     ``target_index`` maps each incoming edge to a row of ``e_target``.  The
     source tensor already contains the source state for each edge; this permits
     sampled bipartite blocks without constructing a dense adjacency matrix.
-    The returned rate is the exact Gaussian KL averaged over incoming edges,
-    not a claim about mutual information of the entire graph representation.
+    The returned rate is the sum of exact Gaussian KL costs over incoming
+    edges, as in Eqs. (3) and (7). Optional ``edge_weights`` affect this cost
+    only, allowing callers to form expectations over target-user graphs.
 
     ``noise=False`` replaces messages by their conditional means.  This is an
     explicit deterministic inference approximation, not Monte Carlo inference.
@@ -37,12 +38,15 @@ class GaussianMessageLayer(nn.Module):
         self.eps = 1e-8
         self.message_projection = nn.Linear(dim, dim, bias=False)
         self.gate = nn.Sequential(
-            nn.Linear((3 if personalized else 2) * dim, dim),
+            nn.Linear(2 * dim, dim),
             nn.Tanh(),
             nn.Linear(dim, 1),
         )
-        self.self_projection = nn.Linear(dim, dim, bias=False)
-        self.aggregate_projection = nn.Linear(dim, dim, bias=False)
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     def forward(
         self,
@@ -53,6 +57,7 @@ class GaussianMessageLayer(nn.Module):
         e_context: Optional[Tensor] = None,
         noise: bool = True,
         noise_values: Optional[Tensor] = None,
+        edge_weights: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         if e_target.ndim != 2 or e_target.shape[1] != self.dim:
             raise ValueError("e_target must have shape [nodes, dim]")
@@ -64,10 +69,15 @@ class GaussianMessageLayer(nn.Module):
             raise ValueError("target_index must have dtype torch.long")
         if e_relation is not None and e_relation.shape != e_source.shape:
             raise ValueError("e_relation must have shape [edges, dim]")
-        if self.personalized and (
-            e_context is None or e_context.shape != e_target.shape
-        ):
-            raise ValueError("personalized messages need e_context [nodes, dim]")
+        # Kept for compatibility with older callers; context conditions the
+        # relation encoder, not the message gate in Eq. (1).
+        if e_context is not None and e_context.shape != e_target.shape:
+            raise ValueError("e_context, when supplied, must have shape [nodes, dim]")
+        if edge_weights is not None:
+            if edge_weights.shape != (e_source.shape[0],):
+                raise ValueError("edge_weights must have shape [edges]")
+            if not torch.isfinite(edge_weights).all() or (edge_weights < 0).any():
+                raise ValueError("edge_weights must be finite and nonnegative")
         if noise_values is not None:
             if not noise:
                 raise ValueError("noise_values requires noise=True")
@@ -78,26 +88,21 @@ class GaussianMessageLayer(nn.Module):
         if e_source.shape[0] == 0:
             # Keep rate.backward() valid even for an entirely empty block.
             rate = sum(parameter.sum() * 0.0 for parameter in self.parameters())
-            e_next = F.elu(
-                self.self_projection(e_target)
-                + self.aggregate_projection(e_aggregate)
-            )
-            return e_next, rate
+            return e_target, rate
 
-        e_signal = self.message_projection(
-            e_source if e_relation is None else e_source * e_relation
-        )
-        e_raw = math.sqrt(self.dim) * e_signal / e_signal.norm(
-            p=2, dim=-1, keepdim=True
-        ).clamp_min(self.eps)
+        e_sender = e_source
         e_receiver = e_target.index_select(0, target_index)
-        if self.personalized:
-            gate_input = torch.cat(
-                [e_context.index_select(0, target_index), e_receiver, e_raw],
-                dim=-1,
-            )
-        else:
-            gate_input = torch.cat([e_receiver, e_source], dim=-1)
+        if e_relation is not None:
+            e_sender = e_sender * e_relation
+            e_receiver = e_receiver * e_relation
+        # Clip the learned signal to the radius-sqrt(d) ball without expanding
+        # small signals. The gate sees the endpoints, not the projected signal.
+        e_signal = self.message_projection(e_sender)
+        scale = (math.sqrt(self.dim) / e_signal.norm(
+            p=2, dim=-1, keepdim=True
+        ).clamp_min(self.eps)).clamp_max(1.0)
+        e_raw = e_signal * scale
+        gate_input = torch.cat([e_sender, e_receiver], dim=-1)
         alpha = torch.sigmoid(self.gate(gate_input)).clamp(1e-6, 1.0 - 1e-6)
 
         e_message = alpha.sqrt() * e_raw
@@ -109,10 +114,8 @@ class GaussianMessageLayer(nn.Module):
         degree = e_target.new_zeros(e_target.shape[0])
         degree.index_add_(0, target_index, e_target.new_ones(target_index.shape[0]))
         e_aggregate = e_aggregate / degree.clamp_min(1.0).sqrt().unsqueeze(-1)
-        e_next = F.elu(
-            self.self_projection(e_target)
-            + self.aggregate_projection(e_aggregate)
-        )
+        # Eq. (2) keeps the unmodulated receiver as an identity residual.
+        e_next = e_target + e_aggregate
 
         # KL(N(sqrt(alpha)*e_raw, (1-alpha)I) || N(0,I)).  Retain
         # the norm term: exact zero and near-zero signals need not have norm d.
@@ -121,7 +124,10 @@ class GaussianMessageLayer(nn.Module):
             alpha * (norm_squared - self.dim)
             - self.dim * torch.log1p(-alpha)
         )
-        return e_next, edge_rate.mean()
+        edge_rate = edge_rate.squeeze(-1)
+        if edge_weights is not None:
+            edge_rate = edge_rate * edge_weights
+        return e_next, edge_rate.sum()
 
 
 class RelationBottleneck(nn.Module):
@@ -146,16 +152,22 @@ class RelationBottleneck(nn.Module):
         mask_temperature: float = 1.0,
         code_temperature: float = 1.0,
         gumbel_temperature: float = 1.0,
+        mask_mode: str = "learned",
+        mask_seed: int = 2024,
     ) -> None:
         super().__init__()
         if n_relations <= 0 or dim <= 0:
             raise ValueError("n_relations and dim must be positive")
-        if n_codes < 2:
-            raise ValueError("n_codes must be at least two")
-        if n_blocks < 2 or dim % n_blocks:
-            raise ValueError("n_blocks must be at least two and divide dim")
-        if not 0 < keep_blocks < n_blocks:
-            raise ValueError("keep_blocks must satisfy 0 < keep_blocks < n_blocks")
+        if n_codes < 1:
+            raise ValueError("n_codes must be at least one")
+        if n_blocks < 1 or dim % n_blocks:
+            raise ValueError("n_blocks must be positive and divide dim")
+        if not 0 < keep_blocks <= n_blocks:
+            raise ValueError("keep_blocks must satisfy 0 < keep_blocks <= n_blocks")
+        if mask_mode not in {"learned", "all", "random"}:
+            raise ValueError("mask_mode must be learned, all, or random")
+        if mask_mode != "all" and keep_blocks == n_blocks:
+            raise ValueError("learned/random masks require keep_blocks < n_blocks")
         if min(mask_temperature, code_temperature, gumbel_temperature) <= 0:
             raise ValueError("all temperatures must be positive")
         rho_tensor = torch.as_tensor(rho, dtype=torch.float32).detach().clone()
@@ -175,6 +187,8 @@ class RelationBottleneck(nn.Module):
         self.mask_temperature = mask_temperature
         self.code_temperature = code_temperature
         self.gumbel_temperature = gumbel_temperature
+        self.mask_mode = mask_mode
+        self.mask_seed = int(mask_seed)
 
         self.relation_embedding = nn.Embedding(n_relations, dim)
         self.feature_projection = nn.Linear(dim, dim, bias=False)
@@ -182,13 +196,49 @@ class RelationBottleneck(nn.Module):
         self.context_projection = nn.Linear(dim, dim, bias=False)
         self.encoder_projection = nn.Linear(dim, dim, bias=False)
         self.codebook = nn.Embedding(n_codes, dim)
-        nn.init.xavier_uniform_(self.relation_embedding.weight)
-        nn.init.xavier_uniform_(self.codebook.weight)
+        for module in self.modules():
+            if isinstance(module, (nn.Linear, nn.Embedding)):
+                nn.init.xavier_uniform_(module.weight)
+                if isinstance(module, nn.Linear) and module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
-    def forward(self, context: Tensor, sample: bool = True) -> Dict[str, Tensor]:
+    def _random_mask(self, user_ids: Tensor, reference: Tensor) -> Tensor:
+        """Fixed Rand-ablation masks keyed by actual user and relation IDs.
+
+        Use private CPU generators so masks do not depend on batch ordering,
+        global RNG state, graph sampling, or whether inference uses a GPU.
+        """
+        masks = []
+        for user_id in user_ids.detach().cpu().tolist():
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(
+                (self.mask_seed + 1_000_003 * int(user_id)) % (2**63 - 1)
+            )
+            priorities = torch.rand(
+                self.n_relations, self.n_blocks, generator=generator
+            )
+            selected = priorities.topk(self.keep_blocks, dim=-1).indices
+            masks.append(torch.zeros_like(priorities).scatter_(-1, selected, 1.0))
+        if not masks:
+            return reference.new_empty((0, self.n_relations, self.n_blocks))
+        return torch.stack(masks).to(device=reference.device, dtype=reference.dtype)
+
+    def forward(
+        self,
+        context: Tensor,
+        sample: bool = True,
+        user_ids: Optional[Tensor] = None,
+    ) -> Dict[str, Tensor]:
         if context.ndim != 2 or context.shape[1] != self.dim:
             raise ValueError("context must have shape [users, dim]")
         users = context.shape[0]
+        if user_ids is not None:
+            if user_ids.shape != (users,) or user_ids.dtype != torch.long:
+                raise ValueError("user_ids must be a torch.long vector of length users")
+            if (user_ids < 0).any():
+                raise ValueError("user_ids must be nonnegative")
+        if self.mask_mode == "random" and user_ids is None:
+            raise ValueError("random masking requires actual user_ids")
         e_features = self.feature_projection(self.relation_embedding.weight).reshape(
             self.n_relations, self.n_blocks, self.block_dim
         )
@@ -196,11 +246,15 @@ class RelationBottleneck(nn.Module):
             users, self.n_blocks, self.block_dim
         )
         scores = torch.einsum("ujd,rjd->urj", e_context, e_features)
-        scores = scores / math.sqrt(self.block_dim)
-        selected = scores.topk(self.keep_blocks, dim=-1).indices
-        mask_hard = torch.zeros_like(scores).scatter_(-1, selected, 1.0)
-        mask_soft = torch.sigmoid(scores / self.mask_temperature)
-        mask = mask_soft + (mask_hard - mask_soft).detach()
+        if self.mask_mode == "all":
+            mask = torch.ones_like(scores)
+        elif self.mask_mode == "random":
+            mask = self._random_mask(user_ids, scores)
+        else:
+            selected = scores.topk(self.keep_blocks, dim=-1).indices
+            mask_hard = torch.zeros_like(scores).scatter_(-1, selected, 1.0)
+            mask_soft = torch.sigmoid(scores / self.mask_temperature)
+            mask = mask_soft + (mask_hard - mask_soft).detach()
         e_masked = (mask.unsqueeze(-1) * e_features.unsqueeze(0)).reshape(
             users, self.n_relations, self.dim
         )
@@ -226,6 +280,11 @@ class RelationBottleneck(nn.Module):
         if users == 0:
             rate = sum(parameter.sum() * 0.0 for parameter in self.parameters())
             rate_per_user = context.new_empty(0)
+        elif self.n_codes == 1:
+            # One symbol has zero information capacity, including in floating
+            # point arithmetic, and still permits a differentiable zero loss.
+            rate_per_user = q.sum(dim=(-1, -2)) * 0.0
+            rate = rate_per_user.mean()
         else:
             # Log-space marginal also handles zero-frequency relation types.
             # No detach: the exact derivative includes the learned marginal.

@@ -1,4 +1,4 @@
-"""ARC: sampled, query-personalized encoders for two-stage relation bottlenecks.
+"""ARC: query-personalized encoders for two-stage relation bottlenecks.
 
 Only ordinary PyTorch operations are used; torch_scatter / PyG are not needed.
 Each computation graph deduplicates (query user, graph node) at every depth.
@@ -22,16 +22,24 @@ class Block:
 
 
 class NeighborSampler:
-    """A fixed sampled adjacency per epoch/evaluation; no padded fake edges.
+    """Full CSR propagation by default; optional sampled diagnostic adjacency.
 
-    Neighborhood normalization is over the sampled neighborhood, not an
-    unbiased estimator of full-graph propagation. Full catalog evaluation
-    builds a single graph for each user, avoiding candidate-chunk dependence.
+    ``fanout=0`` uses every directed edge at every propagation layer, including
+    in the KL sum. Positive fanout opts into a sampled-neighborhood approximation
+    and normalizes by sampled degrees. No padded slot is treated as an edge.
     """
     def __init__(self, graph, fanout, seed):
         self.n_nodes = len(graph.offsets) - 1
-        self.neighbors, self.relations, self.valid = graph.sample_table(
-            fanout, np.random.default_rng(seed))
+        if fanout < 0:
+            raise ValueError("fanout must be nonnegative (0 means the full graph)")
+        self.full_graph = fanout == 0
+        if self.full_graph:
+            self.rows = np.repeat(np.arange(self.n_nodes), np.diff(graph.offsets))
+            self.neighbors = graph.neighbors
+            self.relations = graph.relations
+        else:
+            self.neighbors, self.relations, self.valid = graph.sample_table(
+                fanout, np.random.default_rng(seed))
 
     def blocks(self, queries, nodes, depth):
         queries = np.asarray(queries, dtype=np.int64)
@@ -42,6 +50,20 @@ class NeighborSampler:
             raise ValueError("depth must be positive and query indices nonnegative")
         if len(nodes) == 0 or (nodes < 0).any() or (nodes >= self.n_nodes).any():
             raise ValueError("roots must contain valid graph node IDs")
+        if self.full_graph:
+            # All nodes are needed for the exact all-edge information cost,
+            # even when the ranking batch only reads a small subset of roots.
+            query_ids = np.unique(queries)
+            keys = (query_ids[:, None] * self.n_nodes
+                    + np.arange(self.n_nodes)[None, :]).reshape(-1)
+            offsets = np.arange(len(query_ids))[:, None] * self.n_nodes
+            rows = (offsets + self.rows[None, :]).reshape(-1)
+            neighbors = (offsets + self.neighbors[None, :]).reshape(-1)
+            indices = np.arange(len(keys))
+            block = Block(keys, keys, indices, rows, neighbors,
+                          np.tile(self.relations, len(query_ids)))
+            inverse = np.searchsorted(keys, queries * self.n_nodes + nodes)
+            return [block] * depth, keys, inverse
         keys, inverse = np.unique(queries * self.n_nodes + nodes,
                                   return_inverse=True)
         blocks = []
@@ -69,7 +91,7 @@ class ContextEncoder(nn.Module):
         if layers < 1:
             raise ValueError("layers must be positive")
         self.e_node = nn.Embedding(n_nodes, dim)
-        nn.init.normal_(self.e_node.weight, std=0.1)
+        nn.init.xavier_uniform_(self.e_node.weight)
         self.layers = nn.ModuleList([
             GaussianMessageLayer(dim, personalized=False) for _ in range(layers)])
 
@@ -78,14 +100,17 @@ class ContextEncoder(nn.Module):
             np.zeros(len(nodes), dtype=np.int64), nodes, len(self.layers))
         device = self.e_node.weight.device
         e_node = self.e_node(as_index(leaves % sampler.n_nodes, device))
+        e_output = e_node
         rate = e_node.sum() * 0.0
         for layer, block in zip(self.layers, reversed(blocks)):
+            self_index = as_index(block.self_index, device)
             e_node, layer_rate = layer(
-                e_node[as_index(block.self_index, device)],
+                e_node[self_index],
                 e_node[as_index(block.source_index, device)],
                 as_index(block.target_index, device), noise=noise)
+            e_output = e_output[self_index] + e_node
             rate = rate + layer_rate
-        return e_node[as_index(inverse, device)], rate
+        return e_output[as_index(inverse, device)], rate
 
     def pair_scores(self, users, positives, negatives, n_users, sampler):
         nodes = np.concatenate((users, n_users + positives, n_users + negatives))
@@ -99,6 +124,10 @@ class ContextEncoder(nn.Module):
             raise ValueError("samples and batch_size must be positive")
         self.eval()
         result = self.e_node.weight.new_zeros((n_users, self.e_node.embedding_dim))
+        # Full propagation already computes every node. Do it once per noise
+        # draw rather than repeating the complete graph for each cache chunk.
+        if sampler.full_graph:
+            batch_size = n_users
         for _ in range(samples):
             for start in range(0, n_users, batch_size):
                 nodes = np.arange(start, min(start + batch_size, n_users))
@@ -113,28 +142,37 @@ class ARC(nn.Module):
     def __init__(self, n_users, n_items, n_entities, n_relations, rho,
                  context, dim=64, layers=2, n_codes=4, n_blocks=4,
                  keep_blocks=2, mask_temperature=1.0, code_temperature=1.0,
-                 gumbel_temperature=1.0):
+                 gumbel_temperature=1.0, relation_context='personalized',
+                 mask_mode='learned', mask_seed=2024):
         super().__init__()
         if layers < 1 or tuple(context.shape) != (n_users, dim):
             raise ValueError("layers must be positive; context shape must be [n_users, dim]")
         self.n_users, self.n_items = n_users, n_items
         self.n_nodes = n_users + n_entities
+        if relation_context not in ('personalized', 'global'):
+            raise ValueError("relation_context must be personalized or global")
+        self.relation_context = relation_context
         self.register_buffer("e_context", context.detach().clone())
         self.e_node = nn.Embedding(self.n_nodes, dim)
-        nn.init.normal_(self.e_node.weight, std=0.1)
+        nn.init.xavier_uniform_(self.e_node.weight)
         self.e_ui = nn.Parameter(torch.empty(dim))
-        nn.init.normal_(self.e_ui, std=0.1)
+        nn.init.xavier_uniform_(self.e_ui.unsqueeze(0))
         self.relation = RelationBottleneck(
             n_relations, dim, n_codes, n_blocks, keep_blocks, rho,
             mask_temperature=mask_temperature, code_temperature=code_temperature,
-            gumbel_temperature=gumbel_temperature)
+            gumbel_temperature=gumbel_temperature, mask_mode=mask_mode,
+            mask_seed=mask_seed)
         self.layers = nn.ModuleList([
             GaussianMessageLayer(dim, personalized=True) for _ in range(layers)])
-        self.user_projection = nn.Linear(dim, dim, bias=False)
-        self.item_projection = nn.Linear(dim, dim, bias=False)
+
+    def relation_contexts(self, query_users):
+        """Global ablation changes only the input to the relation encoder."""
+        if self.relation_context == 'global':
+            return self.e_context.mean(0, keepdim=True).expand(len(query_users), -1)
+        return self.e_context[as_index(query_users, self.e_context.device)]
 
     def encode(self, query_users, root_queries, root_nodes, sampler,
-               sample=True, noise=True, relation_state=None):
+               sample=True, noise=True, relation_state=None, query_weights=None):
         if sampler.n_nodes != self.n_nodes:
             raise ValueError("Joint sampler node universe differs from model")
         if len(query_users) == 0 or (np.asarray(query_users) < 0).any() or (
@@ -142,13 +180,26 @@ class ARC(nn.Module):
             raise ValueError("Invalid conditioning user IDs")
         if (np.asarray(root_queries) >= len(query_users)).any():
             raise ValueError("Root query index is outside conditioning user batch")
+        if len(np.unique(query_users)) != len(query_users):
+            raise ValueError("query_users must be unique so relation samples are shared")
         device = self.e_node.weight.device
-        e_context = self.e_context[as_index(query_users, device)]
-        state = (self.relation(e_context, sample=sample)
+        e_context = self.relation_contexts(query_users)
+        state = (self.relation(e_context, sample=sample,
+                               user_ids=as_index(query_users, device))
                  if relation_state is None else relation_state)
+        if query_weights is None:
+            query_weights = e_context.new_full((len(query_users),), 1.0 / len(query_users))
+        else:
+            query_weights = torch.as_tensor(query_weights, dtype=e_context.dtype, device=device)
+            if query_weights.shape != (len(query_users),) or (query_weights < 0).any():
+                raise ValueError("query_weights must be nonnegative and match query_users")
+            if not torch.isfinite(query_weights).all() or not torch.isclose(
+                    query_weights.sum(), query_weights.new_tensor(1.0)):
+                raise ValueError("query_weights must be finite and sum to one")
         blocks, leaves, inverse = sampler.blocks(
             root_queries, root_nodes, len(self.layers))
         e_node = self.e_node(as_index(leaves % self.n_nodes, device))
+        e_output = e_node
         rate = e_node.sum() * 0.0
         for layer, block in zip(self.layers, reversed(blocks)):
             target_queries = as_index(block.targets // self.n_nodes, device)
@@ -159,13 +210,15 @@ class ARC(nn.Module):
             e_relation = state["code"][edge_queries, relations.clamp_min(0)]
             e_relation = torch.where((relations >= 0).unsqueeze(-1),
                                      e_relation, self.e_ui.unsqueeze(0))
+            self_index = as_index(block.self_index, device)
             e_node, layer_rate = layer(
-                e_node[as_index(block.self_index, device)],
+                e_node[self_index],
                 e_node[as_index(block.source_index, device)], target_index,
-                e_relation=e_relation, e_context=e_context[target_queries],
-                noise=noise)
+                e_relation=e_relation, noise=noise,
+                edge_weights=query_weights[edge_queries])
+            e_output = e_output[self_index] + e_node
             rate = rate + layer_rate
-        return e_node[as_index(inverse, device)], rate, state
+        return e_output[as_index(inverse, device)], rate, state
 
     def pair_scores(self, users, positives, negatives, sampler):
         query_users, query_index = np.unique(users, return_inverse=True)
@@ -173,11 +226,11 @@ class ARC(nn.Module):
         root_nodes = np.concatenate((users, self.n_users + positives,
                                      self.n_users + negatives))
         e_node, rate, state = self.encode(
-            query_users, root_queries, root_nodes, sampler)
+            query_users, root_queries, root_nodes, sampler,
+            query_weights=np.bincount(query_index) / len(users))
         e_user, e_pos, e_neg = e_node.chunk(3)
-        e_user = self.user_projection(e_user)
-        pos = (e_user * self.item_projection(e_pos)).sum(-1)
-        neg = (e_user * self.item_projection(e_neg)).sum(-1)
+        pos = (e_user * e_pos).sum(-1)
+        neg = (e_user * e_neg).sum(-1)
         # Uniform user sampling is used by the trainer. Weight repeated users
         # by their multiplicities instead of silently averaging only uniques.
         relation_rate = state["rate_per_user"][as_index(query_index, e_node.device)].mean()
@@ -193,8 +246,7 @@ class ARC(nn.Module):
         for _ in range(samples):
             e_node, _, _ = self.encode(np.array([user]), queries, nodes, sampler,
                                        sample=stochastic, noise=stochastic)
-            e_user = self.user_projection(e_node[:1])
-            scores += (e_user * self.item_projection(e_node[1:])).sum(-1) / samples
+            scores += (e_node[:1] * e_node[1:]).sum(-1) / samples
         return scores
 
 

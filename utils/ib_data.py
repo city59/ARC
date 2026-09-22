@@ -1,7 +1,8 @@
 """Leakage-aware data loading and CSR graph sampling for the IB recommender.
 
-The supplied pickle files are the authoritative train/test split.  Only positive
-training interactions enter a graph; validation is held out from those positives.
+The paper protocol randomly splits unique positive interactions 80/20 with a
+fixed split seed. The supplied split can alternatively be retained explicitly.
+Only training positives enter a graph; optional validation uses training only.
 Items occupy the first ``n_items`` entity indices, while graph node indices put
 users first and all entities after them.  No SciPy/networkx dependency is needed.
 """
@@ -185,16 +186,18 @@ def _integer_array(value, name, columns):
 
 
 def _load_interactions(directory, split):
-    path = directory / (split + "_data.pkl")
+    # The Book .npy arrays contain the same rows as its pandas-backed pickles.
+    # Prefer plain arrays so ARC does not require pandas merely to load data.
+    path = directory / (split + "_data.npy")
     if path.exists():
+        array = np.load(str(path), allow_pickle=False)
+    else:
+        path = directory / (split + "_data.pkl")
+        if not path.exists():
+            raise FileNotFoundError("Missing {}_data.npy/.pkl in {}".format(split, directory))
         # These are the user-supplied trusted archive's pickle files.
         with path.open("rb") as handle:
             array = pickle.load(handle, encoding="bytes")
-    else:
-        path = directory / (split + "_data.npy")
-        if not path.exists():
-            raise FileNotFoundError("Missing {}_data.pkl/.npy in {}".format(split, directory))
-        array = np.load(str(path), allow_pickle=False)
     array = _integer_array(array, str(path), 2)
     if array.shape[1] not in (2, 3):
         raise ValueError("{} must be [user, item] or [user, item, binary_label]".format(path))
@@ -232,18 +235,37 @@ def _fingerprint(arrays, configuration):
     return digest.hexdigest()
 
 
-def load_dataset(data_root, dataset, seed=2024, val_ratio=0.1, inverse=True):
-    """Load one archive dataset without re-splitting its provided test file.
+def load_dataset(data_root, dataset, seed=2024, val_ratio=0.0, inverse=False,
+                 split_mode="random"):
+    """Load the paper's 80/20 positive-interaction protocol.
+
+    ``random`` splits the union of unique positive source interactions, using
+    floor(0.8 * number of positives) training pairs and the remainder for test.
+    ``provided`` preserves the supplied train/test assignment. ``seed`` governs
+    the data split only and should stay fixed across independent training runs.
+    Optional validation is held out only from the resulting training split;
+    the paper default uses all 80% training positives without this holdout.
 
     Movie/music catalog files have columns ``external_item_id, entity_id``;
     their second column is aligned with the processed interactions and KG.
-    Original IDs are exposed by ``*_ids`` arrays. ``relation_ids`` contains
-    original relation types only; inverse types use ``inverse_relation_offset``.
+    Original IDs are exposed by ``*_ids`` arrays. By default the KG propagates
+    in both directions using the SAME original relation identity. ``rho`` counts
+    triples in the original KG, before adding reverse propagation edges, and
+    ``kg_triples`` retains those original directed triples. Duplicate copies of
+    a factual triple are removed because the KG is a set.
+
+    Explicit ``inverse=True`` retains the legacy extension with distinct inverse
+    relation identities and an equally weighted original/inverse relation prior.
+    That extension changes the relation random variable and is not Eq. (6)'s
+    original-KG protocol. ``relation_ids`` always contains the original types;
+    legacy inverse types start at ``inverse_relation_offset``.
     The ID vocabulary may include test users/items, but test labels and edges
     never enter a training graph or sampler.
     """
     if not 0 <= val_ratio < 1:
         raise ValueError("val_ratio must be in [0, 1)")
+    if split_mode not in ("random", "provided"):
+        raise ValueError("split_mode must be 'random' or 'provided'")
     root = Path(data_root).expanduser()
     directory = root / dataset
     if not directory.is_dir() and root.name == dataset:
@@ -258,6 +280,16 @@ def load_dataset(data_root, dataset, seed=2024, val_ratio=0.1, inverse=True):
     if original_overlap:
         raise ValueError("{} positive pairs overlap provided train/test splits".format(
             len(original_overlap)))
+    positive_pairs = np.unique(np.concatenate([original_train, original_test]), axis=0)
+    if split_mode == "random":
+        if len(positive_pairs) < 2:
+            raise ValueError("The 80/20 split requires at least two positive interactions")
+        permutation = np.random.default_rng(seed).permutation(len(positive_pairs))
+        n_train = (4 * len(positive_pairs)) // 5
+        split_train = positive_pairs[permutation[:n_train]]
+        split_test = positive_pairs[permutation[n_train:]]
+    else:
+        split_train, split_test = original_train, original_test
 
     kg_path = directory / "kg_final.npy"
     if kg_path.exists():
@@ -294,8 +326,8 @@ def load_dataset(data_root, dataset, seed=2024, val_ratio=0.1, inverse=True):
         return np.column_stack([np.searchsorted(user_ids, pairs[:, 0]),
                                 np.searchsorted(item_ids, pairs[:, 1])]).astype(np.int64)
 
-    mapped_train = remap_pairs(original_train)
-    mapped_test = remap_pairs(original_test)
+    mapped_train = remap_pairs(split_train)
+    mapped_test = remap_pairs(split_test)
     train_user_items = _user_items(mapped_train)
     valid_user_items = {}
     rng = np.random.default_rng(seed)
@@ -319,13 +351,20 @@ def load_dataset(data_root, dataset, seed=2024, val_ratio=0.1, inverse=True):
     kg[:, 0] = np.fromiter((entity_map[int(x)] for x in raw_kg[:, 0]), dtype=np.int64)
     kg[:, 1] = np.searchsorted(relation_ids, raw_kg[:, 1])
     kg[:, 2] = np.fromiter((entity_map[int(x)] for x in raw_kg[:, 2]), dtype=np.int64)
+    original_relation_counts = np.bincount(kg[:, 1], minlength=n_base_relations)
     inverse_offset = n_base_relations if inverse else None
+    reverse_kg = kg[:, [2, 1, 0]].copy()
     if inverse:
-        inverse_kg = kg[:, [2, 1, 0]].copy()
-        inverse_kg[:, 1] += n_base_relations
-        kg = np.concatenate([kg, inverse_kg], axis=0)
+        reverse_kg[:, 1] += n_base_relations
+        kg = np.concatenate([kg, reverse_kg], axis=0)
+        propagation_kg = kg
+        relation_counts = np.tile(original_relation_counts, 2)
+    else:
+        # The KG is a set: a self-loop or an already-present reverse triple
+        # should not receive a duplicate message when making it bidirectional.
+        propagation_kg = np.unique(np.concatenate([kg, reverse_kg], axis=0), axis=0)
+        relation_counts = original_relation_counts
     n_relations = n_base_relations * (2 if inverse else 1)
-    relation_counts = np.bincount(kg[:, 1], minlength=n_relations)
     rho = (relation_counts / float(relation_counts.sum())).astype(np.float32)
 
     ui_rows = np.concatenate([train_pairs[:, 0], n_users + train_pairs[:, 1]])
@@ -335,12 +374,12 @@ def load_dataset(data_root, dataset, seed=2024, val_ratio=0.1, inverse=True):
     ui_graph = Graph.from_edges(n_users + n_items, ui_rows, ui_neighbors, ui_relations)
     joint_graph = Graph.from_edges(
         n_users + n_entities,
-        np.concatenate([ui_rows, n_users + kg[:, 0]]),
-        np.concatenate([ui_neighbors, n_users + kg[:, 2]]),
-        np.concatenate([ui_relations, kg[:, 1]]))
+        np.concatenate([ui_rows, n_users + propagation_kg[:, 0]]),
+        np.concatenate([ui_neighbors, n_users + propagation_kg[:, 2]]),
+        np.concatenate([ui_relations, propagation_kg[:, 1]]))
 
     config = {"dataset": dataset, "seed": int(seed), "val_ratio": float(val_ratio),
-              "inverse": bool(inverse), "schema": 1}
+              "inverse": bool(inverse), "split_mode": split_mode, "schema": 3}
     fingerprint = _fingerprint(
         [train_pairs, valid_pairs, test_pairs, kg, user_ids, item_ids, entity_ids,
          relation_ids], config)
@@ -362,13 +401,25 @@ def load_dataset(data_root, dataset, seed=2024, val_ratio=0.1, inverse=True):
         "duplicate_train_positives_removed": n_train_positive_rows - len(original_train),
         "duplicate_test_positives_removed": n_test_positive_rows - len(original_test),
         "provided_train_positive_pairs": len(original_train),
+        "provided_test_positive_pairs": len(original_test),
+        "total_unique_positive_pairs": len(positive_pairs),
+        "source_raw_train_fraction": len(train_rows) / float(len(train_rows) + len(test_rows)),
+        "source_positive_train_fraction": len(original_train) / float(len(positive_pairs)),
+        "split_train_positive_pairs": len(split_train),
+        "split_positive_train_fraction": len(split_train) / float(len(positive_pairs)),
         "train_positive_pairs": len(train_pairs), "valid_positive_pairs": len(valid_pairs),
         "test_positive_pairs": len(test_pairs), "train_users": len(train_user_items),
         "valid_users": len(valid_user_items), "test_users": len(test_user_items),
         "test_users_without_train_positives": len(set(test_user_items) - set(train_user_items)),
         "observed_item_ids": len(observed_items), "catalog_items": len(catalog_items),
         "kg_source_triples": kg_input_count, "kg_unique_original_triples": len(raw_kg),
-        "kg_triples_with_inverse": len(kg), "ui_directed_edges": ui_graph.n_edges,
+        "kg_triples_with_inverse": len(kg),
+        "kg_propagation_edges": len(propagation_kg),
+        "kg_reverse_relations": "distinct inverse types (legacy)" if inverse else "same original type",
+        "original_relation_counts": original_relation_counts.tolist(),
+        "rho_source": "original KG and equally weighted inverse identities (legacy)" if inverse
+                      else "unique original KG triples, before reverse propagation",
+        "ui_directed_edges": ui_graph.n_edges,
         "joint_directed_edges": joint_graph.n_edges,
         "relation_counts": relation_counts.tolist(), "rho": rho.tolist(),
         "negative_exclusion": "training positives only; no validation/test labels",
