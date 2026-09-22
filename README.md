@@ -51,5 +51,3 @@ python main.py --eval-only --checkpoint runs/arc/music/train/best.pt --device au
 ```
 
 `auto` selects CUDA when available. Use `--device cpu` to force CPU execution. Logs, checkpoints, and metrics are saved under `<output-dir>/<dataset>/train/` (`smoke/` for smoke tests). Choose a new output directory for each run.
-
-Evaluation uses full-catalog ranking with seen-item filtering. Smoke tests evaluate only a small user subset; full ARC benchmarking remains pending, as stated in the manuscript. See `python main.py --help` for options.
